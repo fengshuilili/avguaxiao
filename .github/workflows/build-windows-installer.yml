@@ -1,0 +1,180 @@
+name: 生成 Windows 安装包
+
+# ============================================================
+# 用法：把这个文件放到仓库的 .github/workflows/ 目录下，文件名随意（.yml 结尾）。
+# 然后在 GitHub 网页上点 Actions -> 生成 Windows 安装包 -> Run workflow。
+# 也可以在仓库里直接改任意文件并提交（push），会自动触发一次。
+# ============================================================
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 读取版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9][^\s+]*)' | Select-Object -First 1
+          $v = if ($m) { $m.Matches[0].Groups[1].Value } else { '1.0.0' }
+          Write-Host "项目版本号: $v"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: 生成 Windows 工程
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          if (-not (Test-Path "windows/CMakeLists.txt")) {
+            Write-Host "仓库里没有 windows 目录，正在用 flutter create 生成..."
+            flutter create --platforms=windows --project-name video_scraper .
+            if ($LASTEXITCODE -ne 0) { throw "Windows 工程生成失败" }
+          }
+          if (-not (Test-Path "windows/CMakeLists.txt")) { throw "未找到 windows/CMakeLists.txt" }
+          Write-Host "Windows 工程就绪"
+
+      - name: 打编译补丁
+        shell: pwsh
+        run: |
+          # 1) 协程兼容宏 + UTF-8 源码，否则 window_manager 编译报错、中文标题乱码
+          $path = "windows/CMakeLists.txt"
+          $content = Get-Content $path -Raw
+          if ($content -notmatch '_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS') {
+            $pattern = '(?m)^include\(flutter/generated_plugins\.cmake\)'
+            if ($content -notmatch $pattern) { throw "找不到 generate_plugins.cmake" }
+            $inject = "add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)`r`nadd_compile_options(`"/utf-8`")`r`ninclude(flutter/generated_plugins.cmake)"
+            $content = [regex]::Replace($content, $pattern, $inject, 1)
+            Set-Content -Path $path -Value $content -Encoding utf8
+            Write-Host "CMakeLists.txt 已打补丁"
+          }
+
+          # 2) 窗口标题改成中文
+          $main = "windows/runner/main.cpp"
+          $c = Get-Content $main -Raw
+          if ($c.Contains('L"video_scraper"')) {
+            $c = $c.Replace('L"video_scraper"', 'L"影片刮削器"')
+            [System.IO.File]::WriteAllText((Join-Path $PWD $main), $c, (New-Object System.Text.UTF8Encoding($true)))
+            Write-Host "窗口标题已改为 影片刮削器"
+          }
+
+      - name: 安装依赖
+        run: flutter pub get
+
+      - name: 编译 Windows 正式版
+        run: flutter build windows --release
+
+      - name: 检查编译产物
+        shell: pwsh
+        run: |
+          $dst = "build/windows/x64/runner/Release"
+          if (-not (Test-Path "$dst/video_scraper.exe")) {
+            Get-ChildItem $dst -ErrorAction SilentlyContinue
+            throw "未找到 video_scraper.exe"
+          }
+          Write-Host "编译成功："
+          Get-ChildItem $dst | Select-Object Name, Length
+
+      - name: 写入 Inno Setup 安装包脚本
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "installer" | Out-Null
+          $iss = @'
+          #define AppName "影片刮削器"
+          #ifndef AppVersion
+            #define AppVersion "1.0.0"
+          #endif
+          #define AppPublisher "duiluyo"
+          #define AppExeName "video_scraper.exe"
+          #define BuildDir "..\build\windows\x64\runner\Release"
+
+          [Setup]
+          AppId={{B7E4C1A2-5D38-4F6B-9A21-8C0D6E4F7A13}
+          AppName={#AppName}
+          AppVersion={#AppVersion}
+          AppVerName={#AppName} {#AppVersion}
+          AppPublisher={#AppPublisher}
+          DefaultDirName={autopf}\{#AppName}
+          DefaultGroupName={#AppName}
+          DisableProgramGroupPage=yes
+          PrivilegesRequired=lowest
+          OutputDir=Output
+          OutputBaseFilename={#AppName}-{#AppVersion}-安装包
+          SetupIconFile=..\windows\runner\resources\app_icon.ico
+          UninstallDisplayIcon={app}\{#AppExeName}
+          UninstallDisplayName={#AppName}
+          Compression=lzma2/max
+          SolidCompression=yes
+          WizardStyle=modern
+          DisableDirPage=auto
+
+          [Languages]
+          Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+          [Files]
+          Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+          Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+          '@
+
+          # 去掉 YAML 块缩进带来的前导空格，并写成 UTF-8 带 BOM（Inno Setup 需要）
+          $lines = $iss -split "`r?`n"
+          $minIndent = ($lines | Where-Object { $_.Trim() -ne '' } | ForEach-Object { ($_ -replace '^(\s*).*$', '$1').Length } | Measure-Object -Minimum).Minimum
+          $clean = ($lines | ForEach-Object { if ($_.Length -ge $minIndent) { $_.Substring($minIndent) } else { $_.TrimStart() } }) -join "`r`n"
+
+          $issPath = Join-Path $PWD "installer/video_scraper.iss"
+          [System.IO.File]::WriteAllText($issPath, $clean, (New-Object System.Text.UTF8Encoding($true)))
+          Write-Host "已生成 $issPath"
+          Get-Content $issPath -TotalCount 3
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 生成安装包
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe，Inno Setup 安装失败" }
+
+          Push-Location "installer"
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "video_scraper.iss"
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "安装包编译失败，请看上面的报错" }
+
+          Get-ChildItem "installer/Output" | Select-Object Name, Length
+
+      - name: 上传安装包（exe）
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/Output/*.exe
+          if-no-files-found: error
+
+      - name: 上传免安装版（zip）
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
