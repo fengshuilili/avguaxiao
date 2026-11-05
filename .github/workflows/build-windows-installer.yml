@@ -120,8 +120,7 @@ jobs:
           WizardStyle=modern
           DisableDirPage=auto
 
-          [Languages]
-          Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+          @@LANGUAGES@@
 
           [Tasks]
           Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -137,10 +136,47 @@ jobs:
           Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
           '@
 
+          # Inno Setup 官方安装包不带中文语言文件，这里先尝试下载；失败就退回英文界面，绝不让构建挂掉
+          $islPath = Join-Path $PWD "installer/ChineseSimplified.isl"
+          $langBlock = ""
+          $useChinese = $false
+          if (Test-Path $islPath) {
+            $useChinese = $true
+            Write-Host "已存在中文语言文件，直接使用"
+          }
+          else {
+            foreach ($url in @(
+              "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl",
+              "https://raw.gitmirror.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl"
+            )) {
+              if ($useChinese) { break }
+              try {
+                Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zh.isl" -UseBasicParsing -TimeoutSec 90
+                $zh = [System.IO.File]::ReadAllText("$env:TEMP\zh.isl", [System.Text.Encoding]::UTF8)
+                if ($zh -match '\[LangOptions\]') {
+                  [System.IO.File]::WriteAllText($islPath, $zh, (New-Object System.Text.UTF8Encoding($true)))
+                  $useChinese = $true
+                  Write-Host "中文语言文件下载成功"
+                }
+                else { Write-Host "下载内容不像语言文件，跳过" -ForegroundColor Yellow }
+              }
+              catch { Write-Host "下载失败（$url）：$($_.Exception.Message)" -ForegroundColor Yellow }
+            }
+          }
+          if ($useChinese) {
+            $langBlock = "[Languages]`r`nName: `"chinesesimplified`"; MessagesFile: `"ChineseSimplified.isl`""
+          }
+          else {
+            Write-Host "未能取得中文语言文件，安装向导将显示英文（不影响功能）" -ForegroundColor Yellow
+          }
+
           # 去掉 YAML 块缩进带来的前导空格，并写成 UTF-8 带 BOM（Inno Setup 需要）
           $lines = $iss -split "`r?`n"
           $minIndent = ($lines | Where-Object { $_.Trim() -ne '' } | ForEach-Object { ($_ -replace '^(\s*).*$', '$1').Length } | Measure-Object -Minimum).Minimum
           $clean = ($lines | ForEach-Object { if ($_.Length -ge $minIndent) { $_.Substring($minIndent) } else { $_.TrimStart() } }) -join "`r`n"
+
+          if ($langBlock) { $clean = $clean.Replace("@@LANGUAGES@@", $langBlock) }
+          else { $clean = $clean.Replace("@@LANGUAGES@@`r`n", "") }
 
           $issPath = Join-Path $PWD "installer/video_scraper.iss"
           [System.IO.File]::WriteAllText($issPath, $clean, (New-Object System.Text.UTF8Encoding($true)))
