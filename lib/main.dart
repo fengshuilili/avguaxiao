@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show PointerDeviceKind;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart' show kBackMouseButton;
 import 'package:flutter/services.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
@@ -18,7 +20,7 @@ import 'package:smb_connect/smb_connect.dart' as smb;
 import 'package:window_manager/legacy.dart';
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.7.1';
+const appVersion = '1.8.1';
 
 
 Future<void> main() async {
@@ -2115,8 +2117,21 @@ class LibraryStore extends ChangeNotifier {
       '$stem-thumb.jpg',
       '$stem-cover.jpg',
     ]);
-    it.hasStills = names.containsKey('extrafanart') ||
-        names.containsKey('$stem-extrafanart'.toLowerCase());
+    Future<bool> folderHasImages(String folder) async {
+      try {
+        await for (final entity in Directory(folder).list(followLinks: false)) {
+          if (entity is File &&
+              _imgExts.contains(p.extension(entity.path).toLowerCase())) {
+            return true;
+          }
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    // 空的 extrafanart 文件夹不算有剧照；必须至少存在一张图片。
+    it.hasStills = await folderHasImages(p.join(dir, 'extrafanart')) ||
+        await folderHasImages(p.join(dir, '$stem-extrafanart'));
     return it;
   }
 
@@ -2148,6 +2163,9 @@ class LibraryStore extends ChangeNotifier {
 }
 
 final libStore = LibraryStore();
+
+/// 影视库搜索框的焦点（Ctrl+F 用）
+final libSearchFocus = FocusNode();
 
 // ═══════════════════════ 影视库：界面 ═══════════════════════
 
@@ -2197,6 +2215,9 @@ class _PickDialogState extends State<_PickDialog> {
                 border: OutlineInputBorder(),
               ),
               onChanged: (v) => setState(() => q = v.trim()),
+              onSubmitted: (_) {
+                if (shown.isNotEmpty) Navigator.pop(context, shown[0].key);
+              },
             ),
             const SizedBox(height: 8),
             Expanded(
@@ -2219,6 +2240,51 @@ class _PickDialogState extends State<_PickDialog> {
         TextButton(
             onPressed: () => Navigator.pop(context), child: const Text('取消')),
       ],
+    );
+  }
+}
+
+/// 电脑版：让页面响应“返回”操作 ——
+/// Esc、Backspace、Alt+←、键盘上的“后退”键、鼠标侧面的“后退”键
+class BackKeys extends StatelessWidget {
+  final Widget child;
+  const BackKeys({super.key, required this.child});
+
+  /// 正在输入文字时，Backspace 是删除字符，不要当成返回
+  bool _typing() {
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    if (ctx == null) return false;
+    return ctx.widget is EditableText ||
+        ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      onPointerDown: (e) {
+        if (e.kind == PointerDeviceKind.mouse &&
+            (e.buttons & kBackMouseButton) != 0) {
+          Navigator.maybePop(context);
+        }
+      },
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (node, event) {
+          if (event is! KeyDownEvent) return KeyEventResult.ignored;
+          final k = event.logicalKey;
+          final alt = HardwareKeyboard.instance.isAltPressed;
+          final back = k == LogicalKeyboardKey.escape ||
+              k == LogicalKeyboardKey.browserBack ||
+              (k == LogicalKeyboardKey.backspace && !_typing()) ||
+              (alt && k == LogicalKeyboardKey.arrowLeft);
+          if (back) {
+            Navigator.maybePop(context);
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: child,
+      ),
     );
   }
 }
@@ -2255,7 +2321,10 @@ class StatsPage extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) =>
+      BackKeys(child: _buildBody(context));
+
+  Widget _buildBody(BuildContext context) {
     return DefaultTabController(
       length: 3,
       child: Scaffold(
@@ -2312,11 +2381,14 @@ Widget _posterImage(String path, {BoxFit fit = BoxFit.cover, int? cacheWidth}) {
 class LibraryPage extends StatefulWidget {
   /// 对一批影片重新刮削（由刮削页面执行）
   final Future<void> Function(List<LibItem> items) onRescrape;
+  /// 只补刮剧照，不改动影片资料文件。
+  final Future<void> Function(List<LibItem> items) onRescrapeStills;
   /// 修复图片后，通知主界面刷新「撤销」按钮
   final VoidCallback onJournalChanged;
   const LibraryPage({
     super.key,
     required this.onRescrape,
+    required this.onRescrapeStills,
     required this.onJournalChanged,
   });
 
@@ -2411,6 +2483,9 @@ class _LibraryPageState extends State<LibraryPage> {
           break;
         case 'imgfix':
           if (!it.needsImageFix) return false;
+          break;
+        case 'nostills':
+          if (it.hasStills) return false;
           break;
         case 'dup':
           if (!dupKeys.contains(it.num)) return false;
@@ -2860,6 +2935,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final list = _filtered();
     final fixable = list.where((e) => !e.hasNfo || e.incomplete).toList();
     final imgfix = list.where((e) => e.needsImageFix).toList();
+    final missingStills = list.where((e) => !e.hasStills).toList();
     const quicks = [
       ['all', '全部'],
       ['fav', '收藏'],
@@ -2867,6 +2943,7 @@ class _LibraryPageState extends State<LibraryPage> {
       ['unscraped', '未刮削'],
       ['incomplete', '缺封面'],
       ['imgfix', '图片待修复'],
+      ['nostills', '缺剧照'],
       ['dup', '重复番号'],
     ];
     return Scaffold(
@@ -2913,15 +2990,28 @@ class _LibraryPageState extends State<LibraryPage> {
             child: Row(
               children: [
                 Expanded(
-                  child: TextField(
-                    controller: _searchCtl,
-                    decoration: const InputDecoration(
-                      hintText: '搜索番号、标题、演员、厂商、系列',
-                      prefixIcon: Icon(Icons.search),
-                      isDense: true,
-                      border: OutlineInputBorder(),
+                  child: Focus(
+                    onKeyEvent: (node, event) {
+                      if (event is KeyDownEvent &&
+                          event.logicalKey == LogicalKeyboardKey.escape) {
+                        _searchCtl.clear();
+                        setState(() => _q = '');
+                        libSearchFocus.unfocus();
+                        return KeyEventResult.handled;
+                      }
+                      return KeyEventResult.ignored;
+                    },
+                    child: TextField(
+                      controller: _searchCtl,
+                      focusNode: libSearchFocus,
+                      decoration: const InputDecoration(
+                        hintText: '搜索番号、标题、演员、厂商、系列（Ctrl+F）',
+                        prefixIcon: Icon(Icons.search),
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (v) => setState(() => _q = v),
                     ),
-                    onChanged: (v) => setState(() => _q = v),
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -3038,6 +3128,20 @@ class _LibraryPageState extends State<LibraryPage> {
                 ),
               ),
             ),
+          if (missingStills.isNotEmpty)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: TextButton.icon(
+                  onPressed: libStore.scanning
+                      ? null
+                      : () => widget.onRescrapeStills(missingStills),
+                  icon: const Icon(Icons.photo_library_outlined),
+                  label: Text('一键补刮剧照 ${missingStills.length} 部'),
+                ),
+              ),
+            ),
           Expanded(
             child: libStore.folders.isEmpty
                 ? Center(
@@ -3079,6 +3183,141 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 }
 
+/// 把字节数显示成 B / KB / MB / GB
+String fmtSize(int bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var v = bytes.toDouble();
+  var i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return i == 0 ? '$bytes B' : '${v.toStringAsFixed(2)} ${units[i]}';
+}
+
+/// 剧照大图浏览：上一张 / 下一张（也可以用键盘 ← →），滚轮缩放
+class _StillViewer extends StatefulWidget {
+  final List<String> paths;
+  final int initial;
+  const _StillViewer({required this.paths, required this.initial});
+
+  @override
+  State<_StillViewer> createState() => _StillViewerState();
+}
+
+class _StillViewerState extends State<_StillViewer> {
+  late int _i;
+
+  @override
+  void initState() {
+    super.initState();
+    _i = widget.initial;
+  }
+
+  void _go(int d) {
+    final n = widget.paths.length;
+    if (n == 0) return;
+    setState(() => _i = (_i + d + n) % n);
+  }
+
+  Widget _arrow(IconData icon, String tip, VoidCallback onTap) {
+    return Material(
+      color: Colors.black54,
+      shape: const CircleBorder(),
+      child: IconButton(
+        tooltip: tip,
+        iconSize: 32,
+        color: Colors.white,
+        icon: Icon(icon),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    final n = widget.paths.length;
+    return Focus(
+      autofocus: true,
+      onKeyEvent: (node, event) {
+        if (event is KeyDownEvent) {
+          if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+            _go(-1);
+            return KeyEventResult.handled;
+          }
+          if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+            _go(1);
+            return KeyEventResult.handled;
+          }
+        }
+        return KeyEventResult.ignored;
+      },
+      child: Dialog(
+        insetPadding: const EdgeInsets.all(16),
+        backgroundColor: Colors.black,
+        child: SizedBox(
+          width: size.width * 0.88,
+          height: size.height * 0.86,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: InteractiveViewer(
+                  key: ValueKey(_i),
+                  maxScale: 6,
+                  child: Center(
+                    child: _posterImage(widget.paths[_i], fit: BoxFit.contain),
+                  ),
+                ),
+              ),
+              if (n > 1)
+                Positioned(
+                  left: 8,
+                  top: 0,
+                  bottom: 0,
+                  child: Center(
+                    child: _arrow(Icons.chevron_left, '上一张（←）', () => _go(-1)),
+                  ),
+                ),
+              if (n > 1)
+                Positioned(
+                  right: 8,
+                  top: 0,
+                  bottom: 0,
+                  child: Center(
+                    child: _arrow(Icons.chevron_right, '下一张（→）', () => _go(1)),
+                  ),
+                ),
+              Positioned(
+                top: 8,
+                right: 8,
+                child: _arrow(Icons.close, '关闭', () => Navigator.pop(context)),
+              ),
+              Positioned(
+                bottom: 10,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text('${_i + 1} / $n',
+                        style: const TextStyle(color: Colors.white)),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class LibraryDetailPage extends StatefulWidget {
   final LibItem item;
   const LibraryDetailPage({super.key, required this.item});
@@ -3089,17 +3328,21 @@ class LibraryDetailPage extends StatefulWidget {
 
 class _LibraryDetailPageState extends State<LibraryDetailPage> {
   List<String> _stills = [];
+  int? _size; // 视频文件大小（字节）
+  final _stillCtl = ScrollController();
 
   @override
   void initState() {
     super.initState();
     libStore.addListener(_onStore);
     _loadStills();
+    _loadSize();
   }
 
   @override
   void dispose() {
     libStore.removeListener(_onStore);
+    _stillCtl.dispose();
     super.dispose();
   }
 
@@ -3128,6 +3371,20 @@ class _LibraryDetailPageState extends State<LibraryDetailPage> {
       } catch (_) {}
     }
     if (mounted) setState(() => _stills = out);
+  }
+
+  Future<void> _loadSize() async {
+    try {
+      final n = await File(widget.item.path).length();
+      if (mounted) setState(() => _size = n);
+    } catch (_) {}
+  }
+
+  void _openStill(int i) {
+    showDialog(
+      context: context,
+      builder: (_) => _StillViewer(paths: _stills, initial: i),
+    );
   }
 
   void _snack(String t) {
@@ -3164,7 +3421,8 @@ class _LibraryDetailPageState extends State<LibraryDetailPage> {
           child: TextField(
             controller: c,
             autofocus: true,
-            maxLines: null,
+            maxLines: 1,
+            onSubmitted: (v) => Navigator.pop(ctx, v),
             decoration: const InputDecoration(border: OutlineInputBorder()),
           ),
         ),
@@ -3224,7 +3482,10 @@ class _LibraryDetailPageState extends State<LibraryDetailPage> {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) =>
+      BackKeys(child: _buildPage(context));
+
+  Widget _buildPage(BuildContext context) {
     final it = widget.item;
     final big = it.fanart.isNotEmpty
         ? it.fanart
@@ -3304,6 +3565,7 @@ class _LibraryDetailPageState extends State<LibraryDetailPage> {
           _info('番号', it.num),
           _info('发行日期', it.date),
           _info('时长', it.runtime > 0 ? '${it.runtime} 分钟' : ''),
+          _info('文件大小', _size == null ? '' : fmtSize(_size!)),
           _info('导演', it.director),
           _chips('演员', it.actors, 'actor'),
           _chips('类别', it.genres, 'genre'),
@@ -3318,24 +3580,35 @@ class _LibraryDetailPageState extends State<LibraryDetailPage> {
                 style: const TextStyle(color: Colors.grey)),
             const SizedBox(height: 6),
             SizedBox(
-              height: 150,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                itemCount: _stills.length,
-                itemBuilder: (_, i) => Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: GestureDetector(
-                    onTap: () => showDialog(
-                      context: context,
-                      builder: (_) => Dialog(
-                        child: InteractiveViewer(
-                          child: _posterImage(_stills[i], fit: BoxFit.contain),
+              height: 168,
+              child: ScrollConfiguration(
+                behavior: ScrollConfiguration.of(context).copyWith(
+                  dragDevices: {
+                    PointerDeviceKind.touch,
+                    PointerDeviceKind.mouse,
+                    PointerDeviceKind.trackpad,
+                  },
+                ),
+                child: Scrollbar(
+                  controller: _stillCtl,
+                  thumbVisibility: true,
+                  child: ListView.builder(
+                    controller: _stillCtl,
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.only(bottom: 16),
+                    itemCount: _stills.length,
+                    itemBuilder: (_, i) => Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: GestureDetector(
+                        onTap: () => _openStill(i),
+                        child: MouseRegion(
+                          cursor: SystemMouseCursors.click,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(6),
+                            child: _posterImage(_stills[i], cacheWidth: 400),
+                          ),
                         ),
                       ),
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: _posterImage(_stills[i], cacheWidth: 400),
                     ),
                   ),
                 ),
@@ -3763,6 +4036,107 @@ class _HomePageState extends State<HomePage> {
         '${ok > 0 ? '（可点右上角 ↩ 撤销）' : ''}');
     if (mounted) setState(() => _running = false);
     if (!Platform.isAndroid) libStore.rescan();
+  }
+
+  /// 影视库专用：只补刮缺失的剧照，不覆盖 NFO / 封面 / 字幕，也不移动视频。
+  Future<void> _rescrapeLibraryStills(List<LibItem> list) async {
+    if (_running || _scanning || list.isEmpty) return;
+    _syncCfg();
+    setState(() {
+      _tab = 0;
+      _running = true;
+      _cancel = false;
+      _done = 0;
+      _total = list.length;
+      _logs.clear();
+      _failed.clear();
+    });
+
+    _log('影片刮削器 v$appVersion');
+    _log('🖼️ 开始为 ${list.length} 部缺少剧照的影片补刮（仅下载剧照）');
+    if (!s.useJavbus && !s.useJavdb) {
+      _log('❌ 请至少在设置中启用 JavBus 或 JavDB；DMM 只提供封面，不提供剧照。');
+      if (mounted) setState(() => _running = false);
+      return;
+    }
+
+    final net = Net(s.proxy);
+    final fs = LocalFs();
+    _cache.clear();
+    var ok = 0, fail = 0, skipped = 0;
+    try {
+      for (final it in list) {
+        if (_cancel) {
+          _log('⏹ 已停止');
+          break;
+        }
+        final num = it.num.isNotEmpty ? it.num : (extractCode(it.path) ?? '');
+        if (num.isEmpty) {
+          fail++;
+          _log('❌ ${it.stem}：无法识别番号');
+          if (mounted) setState(() => _done++);
+          continue;
+        }
+
+        _log('🔎 $num（${p.basename(it.path)}）');
+        try {
+          final tasks = <Future<Partial?>>[];
+          if (s.useJavbus) {
+            tasks.add(_safe(
+                'JavBus', () => scrapeJavbus(net, s.javbusUrl, num)));
+          }
+          if (s.useJavdb) {
+            tasks.add(
+                _safe('JavDB', () => scrapeJavdb(net, s.javdbUrl, num)));
+          }
+          final parts = (await Future.wait(tasks)).whereType<Partial>().toList();
+          final movie = mergeAll(num, parts);
+
+          if (movie.stills.isEmpty) {
+            fail++;
+            _log('   ✖ 已启用的刮削源没有提供剧照');
+          } else {
+            // 保持原有保存规则：影片独立文件夹用 extrafanart；
+            // 未独立整理的影片用「视频文件名-extrafanart」。
+            final folderParts =
+                folderPartsFor(movie, s.folderTpl, it.stem);
+            final ownFolder = _tailMatches(it.dir, folderParts);
+            final stillDir = ownFolder
+                ? p.join(it.dir, 'extrafanart')
+                : p.join(it.dir, '${it.stem}-extrafanart');
+
+            final count = await downloadStills(
+              net,
+              fs,
+              movie.stills,
+              stillDir,
+              s.stillsMax,
+              (path) => _log('   ✓ 已保存：${p.basename(path)}'),
+            );
+            if (count > 0) {
+              ok++;
+              _log('   ✅ 成功下载 $count 张剧照');
+            } else {
+              fail++;
+              _log('   ✖ 没有成功下载剧照（可能是图片源失效或网络问题）');
+            }
+          }
+        } catch (e) {
+          fail++;
+          _log('   ❌ 补刮失败：${errText(e)}');
+        }
+
+        if (mounted) setState(() => _done++);
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    } finally {
+      net.close();
+      await fs.close();
+    }
+
+    await libStore.rescan();
+    _log('🎉 剧照补刮结束：成功 $ok 部，失败 $fail 部，跳过 $skipped 部');
+    if (mounted) setState(() => _running = false);
   }
 
   /// 影视库里的「补刮 / 重新刮削」：对选中的影片重新刮削（覆盖已有 NFO 和封面）
@@ -4376,6 +4750,7 @@ class _HomePageState extends State<HomePage> {
           controller: c,
           autofocus: true,
           textCapitalization: TextCapitalization.characters,
+          onSubmitted: (v) => Navigator.pop(dctx, v),
           decoration: const InputDecoration(
             hintText: '例如 MVSD-696',
             border: OutlineInputBorder(),
@@ -4677,7 +5052,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     if (Platform.isAndroid) return _buildScrape(context);
-    return Scaffold(
+    return _withShortcuts(Scaffold(
       body: Row(
         children: [
           NavigationRail(
@@ -4703,6 +5078,7 @@ class _HomePageState extends State<HomePage> {
                 _buildScrape(context),
                 LibraryPage(
                   onRescrape: _rescrapeLibrary,
+                  onRescrapeStills: _rescrapeLibraryStills,
                   onJournalChanged: _loadJournalInfo,
                 ),
               ],
@@ -4710,6 +5086,30 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
+    ));
+  }
+
+  /// 电脑版快捷键：Ctrl+1 / Ctrl+2 切换页面，Ctrl+F 搜索，F5 / Ctrl+R 重新扫描影视库
+  Widget _withShortcuts(Widget child) {
+    void rescan() {
+      if (_tab == 1) libStore.rescan();
+    }
+
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.digit1, control: true): () =>
+            setState(() => _tab = 0),
+        const SingleActivator(LogicalKeyboardKey.digit2, control: true): () =>
+            setState(() => _tab = 1),
+        const SingleActivator(LogicalKeyboardKey.f5): rescan,
+        const SingleActivator(LogicalKeyboardKey.keyR, control: true): rescan,
+        const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
+          setState(() => _tab = 1);
+          WidgetsBinding.instance.addPostFrameCallback(
+              (_) => libSearchFocus.requestFocus());
+        },
+      },
+      child: Focus(autofocus: true, child: child),
     );
   }
 
